@@ -35,38 +35,88 @@ type gitStatus struct {
 	Behind       int    `json:"behind"`
 }
 
-// buildRigResponse creates a rigResponse with agent counts and last activity.
-func (s *Server) buildRigResponse(cfg *config.City, rig config.Rig, sp runtime.Provider, cityName, cityPath string) rigResponse {
-	tmpl := cfg.Workspace.SessionTemplate
-	var agentCount, runningCount int
-	var maxActivity time.Time
+// rigAgentSession is one configured agent session as one request sees it.
+type rigAgentSession struct {
+	sessionName  string
+	exists       bool
+	running      bool
+	lastActivity *time.Time
+}
 
+// rigSessionSnapshot holds one request's configured agent sessions grouped by
+// rig. Each session is observed once, so the rig counts, the activity and the
+// suspended state all derive from the same reads rather than repeating them
+// per rig.
+type rigSessionSnapshot struct {
+	sp     runtime.Provider
+	byRig  map[string][]rigAgentSession
+	listed sessionListing
+}
+
+// snapshotRigSessions observes the configured agent sessions of rig only, or of
+// every rig when only is empty. The session listing is read once per call.
+func snapshotRigSessions(cfg *config.City, sp runtime.Provider, cityName, cityPath, only string) rigSessionSnapshot {
+	tmpl := cfg.Workspace.SessionTemplate
+	listed := listRuntimeSessions(sp)
+	snap := rigSessionSnapshot{
+		sp:     sp,
+		byRig:  make(map[string][]rigAgentSession),
+		listed: listed,
+	}
 	for _, a := range cfg.Agents {
-		if workdirutil.ConfiguredRigName(cityPath, a, cfg.Rigs) != rig.Name {
+		rigName := workdirutil.ConfiguredRigName(cityPath, a, cfg.Rigs)
+		if rigName == "" || (only != "" && rigName != only) {
 			continue
 		}
 		processNames := config.AgentProcessNames(cfg, a, exec.LookPath)
-		expanded := expandAgent(a, cityName, tmpl, sp)
-		for _, ea := range expanded {
-			agentCount++
+		for _, ea := range expandAgent(a, cityName, tmpl, sp) {
 			sessionName := agent.SessionNameFor(cityName, ea.qualifiedName, tmpl)
-			obs := observeProviderSession(sp, sessionName, processNames)
-			if obs.Running {
-				runningCount++
-			}
-			if obs.LastActivity != nil && obs.LastActivity.After(maxActivity) {
-				maxActivity = *obs.LastActivity
-			}
+			snap.byRig[rigName] = append(snap.byRig[rigName], observeRigAgentSession(sp, sessionName, processNames, listed))
+		}
+	}
+	return snap
+}
+
+// observeRigAgentSession reads liveness for one session, which is cached by the
+// runtime provider. Only a running session pays for an activity read.
+func observeRigAgentSession(sp runtime.Provider, sessionName string, processNames []string, listed sessionListing) rigAgentSession {
+	sess := rigAgentSession{
+		sessionName: sessionName,
+		exists:      listed.mayExist(sessionName),
+	}
+	sess.running = runtime.ObserveLiveness(sp, sessionName, processNames).Running
+	if !sess.running {
+		return sess
+	}
+	if lastActive, err := sp.GetLastActivity(sessionName); err == nil && !lastActive.IsZero() {
+		last := lastActive
+		sess.lastActivity = &last
+	}
+	return sess
+}
+
+// buildRigResponse creates a rigResponse with agent counts and last activity
+// from the request's session snapshot.
+func (s *Server) buildRigResponse(rig config.Rig, snap rigSessionSnapshot, cityPath string) rigResponse {
+	sessions := snap.byRig[rig.Name]
+	var runningCount int
+	var maxActivity time.Time
+	for _, sess := range sessions {
+		if sess.running {
+			runningCount++
+		}
+		if sess.lastActivity != nil && sess.lastActivity.After(maxActivity) {
+			maxActivity = *sess.lastActivity
 		}
 	}
 
 	resp := rigResponse{
 		Name:          rig.Name,
 		Path:          rig.Path,
-		Suspended:     s.rigSuspended(cfg, rig, sp, cityName, cityPath),
+		Suspended:     rigSuspended(rig, sessions, snap.sp, cityPath),
 		Prefix:        rig.Prefix,
 		DefaultBranch: rig.DefaultBranch,
-		AgentCount:    agentCount,
+		AgentCount:    len(sessions),
 		RunningCount:  runningCount,
 	}
 	if !maxActivity.IsZero() {
@@ -82,29 +132,35 @@ func (s *Server) buildRigResponse(cfg *config.City, rig config.Rig, sp runtime.P
 // metadata. The deprecated `[[rig]] suspended` field in city.toml is
 // intentionally NOT consulted — `gc doctor` surfaces it as a migration
 // target.
-func (s *Server) rigSuspended(cfg *config.City, rig config.Rig, sp runtime.Provider, cityName, cityPath string) bool {
+func rigSuspended(rig config.Rig, sessions []rigAgentSession, sp runtime.Provider, cityPath string) bool {
 	if rs, err := suspensionstate.Load(fsys.OSFS{}, cityPath); err == nil &&
 		suspensionstate.EffectiveRigSuspended(rs, rig.Name, rig.EffectiveSuspendedOnStart()) {
 		return true
 	}
-	tmpl := cfg.Workspace.SessionTemplate
-	var agentCount, suspendedCount int
-	for _, a := range cfg.Agents {
-		if workdirutil.ConfiguredRigName(cityPath, a, cfg.Rigs) != rig.Name {
-			continue
-		}
-		processNames := config.AgentProcessNames(cfg, a, exec.LookPath)
-		expanded := expandAgent(a, cityName, tmpl, sp)
-		for _, ea := range expanded {
-			agentCount++
-			sessionName := agent.SessionNameFor(cityName, ea.qualifiedName, tmpl)
-			obs := observeProviderSession(sp, sessionName, processNames)
-			if obs.Suspended {
-				suspendedCount++
-			}
+	if len(sessions) == 0 {
+		return false
+	}
+	// Suspended metadata lives on the session itself, so a rig with any
+	// session missing cannot be suspended by metadata. Checking every
+	// session's existence first skips the metadata reads in that case.
+	for _, sess := range sessions {
+		if !sess.exists {
+			return false
 		}
 	}
-	return agentCount > 0 && suspendedCount == agentCount
+	for _, sess := range sessions {
+		if !sessionMetadataIsTrue(sp, sess.sessionName, "suspended") {
+			return false
+		}
+	}
+	return true
+}
+
+// sessionMetadataIsTrue reports whether the session metadata key is "true".
+// A read error reads as false, matching an unset key.
+func sessionMetadataIsTrue(sp runtime.Provider, sessionName, key string) bool {
+	value, err := sp.GetMeta(sessionName, key)
+	return err == nil && strings.TrimSpace(value) == "true"
 }
 
 // gitStatusTimeout bounds how long git operations can take per rig.

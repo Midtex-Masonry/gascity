@@ -186,6 +186,10 @@ func TestRigEnrichmentUsesExplicitProviderDetectedProcessNames(t *testing.T) {
 
 func TestRigSuspendResume(t *testing.T) {
 	state := newFakeMutatorState(t)
+	// Suspended metadata lives on a session, and the tmux provider cannot
+	// write it for a session that has not started, so start the rig's
+	// sessions before the suspend action marks them.
+	startRigAgentSessions(t, state, "myrig")
 	h := newTestCityHandler(t, state)
 
 	// Suspend rig.

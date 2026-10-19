@@ -50,6 +50,9 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 	}
 
 	var agents []agentResponse
+	// Session existence is listed once per request, so the per-agent suspended
+	// read below only runs for sessions that exist to carry it.
+	listed := listRuntimeSessions(sp)
 	for _, a := range cfg.Agents {
 		// Provenance is a property of the declared agent, shared by every
 		// pool-expanded instance, so compute it once per source agent.
@@ -74,7 +77,7 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 			}
 
 			suspended := ea.suspended
-			if v, err := sp.GetMeta(sessionName, "suspended"); err == nil && v == "true" {
+			if listed.mayExist(sessionName) && sessionMetadataIsTrue(sp, sessionName, "suspended") {
 				suspended = true
 			}
 
