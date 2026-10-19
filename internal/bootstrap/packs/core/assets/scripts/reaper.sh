@@ -53,7 +53,7 @@ MAX_AGE="${GC_REAPER_MAX_AGE:-24h}"
 PURGE_AGE="${GC_REAPER_PURGE_AGE:-168h}"
 STALE_ISSUE_AGE="${GC_REAPER_STALE_ISSUE_AGE:-720h}"
 SESSION_PURGE_AGE="${GC_REAPER_SESSION_PURGE_AGE:-720h}"
-SESSION_BEAD_PATTERN="${GC_REAPER_SESSION_BEAD_PATTERN-gm-*}"
+SESSION_BEAD_PATTERN="${GC_REAPER_SESSION_BEAD_PATTERN-}"
 SESSION_STATE_PRUNE_AGE="${GC_REAPER_SESSION_STATE_PRUNE_AGE:-24h}"
 ALERT_THRESHOLD="${GC_REAPER_ALERT_THRESHOLD:-500}"
 MAIL_ALERT_THRESHOLD="${GC_REAPER_MAIL_ALERT_THRESHOLD:-0}"  # 0 = disabled
@@ -1151,8 +1151,9 @@ $DATABASES
 EOF
 
 # Step 6: prune closed session beads from the city's primary bead store.
-# GC_REAPER_SESSION_BEAD_PATTERN defaults to 'gm-*' (legacy Gas Manager prefix).
-# Set to empty string to activate the type-safe SQL path (targets issue_type=session only).
+# GC_REAPER_SESSION_BEAD_PATTERN defaults to empty, which selects the type-safe
+# SQL path (targets issue_type=session only, so it works for any bead prefix).
+# Set it to a bead-ID glob such as 'gm-*' to route through gc bd prune instead.
 if [ -d "$CITY_BEADS_DIR" ]; then
     SESSION_PRUNE_ATTEMPTED=1
     if [ -n "$SESSION_BEAD_PATTERN" ]; then
@@ -1192,9 +1193,14 @@ if [ -d "$CITY_BEADS_DIR" ]; then
                     BATCH_COUNT=$(printf '%s\n' "$BATCH_IDS" | grep -c . || true)
                     [ "$BATCH_COUNT" -gt 0 ] || break
                     SQL_IDS=$(printf '%s\n' "$BATCH_IDS" | sed "s/.*/'&'/" | tr '\n' ',' | sed 's/,$//')
+                    # Child rows go before the issues rows, in bd's own order
+                    # (labels, dependencies, events, comments), so the batch leaves
+                    # no orphans even where a foreign key does not cascade.
                     dolt_sql -r csv -q "USE \`${CITY_DB}\`;
 DELETE FROM labels WHERE issue_id IN (${SQL_IDS});
 DELETE FROM dependencies WHERE issue_id IN (${SQL_IDS}) OR depends_on_issue_id IN (${SQL_IDS});
+DELETE FROM events WHERE issue_id IN (${SQL_IDS});
+DELETE FROM comments WHERE issue_id IN (${SQL_IDS});
 DELETE FROM issues WHERE id IN (${SQL_IDS});
 CALL DOLT_COMMIT('-A', '-m', 'reaper: session_beads_pruned=${BATCH_COUNT} type=session age>${SESSION_AGE_H}h', '--author', 'reaper <reaper@gascity.local>');" >/dev/null \
                         || { record_anomaly "session" "SQL cascade failed at offset $TOTAL"; break; }
