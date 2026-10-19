@@ -217,16 +217,19 @@ func TestCachedStoreHealthRefreshSurvivesLeaderCancellation(t *testing.T) {
 			return want, nil
 		}
 
+		// The canceled leader returns at once with its own cancellation; the
+		// refresh it started keeps running for live callers.
 		leaderCtx, cancelLeader := context.WithCancel(context.Background())
+		leaderErr := make(chan error, 1)
 		go func() {
-			got, err := s.cachedStoreHealth(leaderCtx, time.Now())
-			if err != nil {
-				t.Errorf("cachedStoreHealth: %v", err)
-			}
-			results <- got
+			_, err := s.cachedStoreHealth(leaderCtx, time.Now())
+			leaderErr <- err
 		}()
 		<-computeStarted
 		cancelLeader()
+		if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+			t.Errorf("canceled leader error = %v, want context.Canceled", err)
+		}
 
 		go func() {
 			got, err := s.cachedStoreHealth(context.Background(), time.Now())
@@ -235,15 +238,10 @@ func TestCachedStoreHealthRefreshSurvivesLeaderCancellation(t *testing.T) {
 			}
 			results <- got
 		}()
-		synctest.Wait()
-
 		close(releaseCompute)
-		synctest.Wait()
 
-		for i := range 2 {
-			if got := <-results; got != want {
-				t.Errorf("caller %d got cachedStoreHealth = %p, want request-independent result %p", i, got, want)
-			}
+		if got := <-results; got != want {
+			t.Errorf("live caller got cachedStoreHealth = %p, want request-independent result %p", got, want)
 		}
 		if got := calls.Load(); got != 1 {
 			t.Errorf("computer calls with canceled leader and live waiter = %d, want 1", got)
@@ -264,17 +262,24 @@ func TestCachedStoreHealthTTLStartsAfterComputeCompletes(t *testing.T) {
 			return want, nil
 		}
 
+		// The refresh outlives the request wait budget, so the first read
+		// reports it as still running instead of blocking the request.
 		first, err := s.cachedStoreHealth(context.Background(), time.Now())
-		if err != nil {
-			t.Fatalf("first cachedStoreHealth: %v", err)
+		if err == nil {
+			t.Fatal("first cachedStoreHealth error = nil, want still-running error for a refresh past the wait budget")
 		}
+		if first != nil {
+			t.Fatalf("first cachedStoreHealth = %+v, want nil with no prior value", first)
+		}
+
+		// Let the detached refresh finish, then read it back.
+		time.Sleep(storeHealthCacheTTL + 2*time.Second)
 		second, err := s.cachedStoreHealth(context.Background(), time.Now())
 		if err != nil {
 			t.Fatalf("second cachedStoreHealth: %v", err)
 		}
-
-		if first != want || second != want {
-			t.Fatalf("cached results = (%p, %p), want (%p, %p)", first, second, want, want)
+		if second != want {
+			t.Fatalf("second cachedStoreHealth = %p, want %p", second, want)
 		}
 		if got := calls.Load(); got != 1 {
 			t.Fatalf("computer calls across immediate post-compute read = %d, want 1", got)

@@ -99,6 +99,8 @@ type Server struct {
 	storeHealthMu       sync.Mutex
 	storeHealthEntry    *StatusStoreHealth
 	storeHealthExpires  time.Time
+	storeHealthErr      error
+	storeHealthRetryAt  time.Time
 	storeHealthComputer func(ctx context.Context) (*StatusStoreHealth, error)
 	storeHealthFlight   singleflight.Group
 
